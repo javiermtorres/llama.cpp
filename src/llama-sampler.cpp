@@ -3822,6 +3822,182 @@ struct llama_sampler * llama_sampler_init_infill(const struct llama_vocab * voca
     );
 }
 
+// lua sampler
+
+#ifdef LLAMA_USE_LUA
+
+extern "C" {
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+}
+
+struct llama_sampler_lua {
+    std::string script_path;
+    lua_State * L;
+};
+
+static const char * llama_sampler_lua_name(const struct llama_sampler * /*smpl*/) {
+    return "lua";
+}
+
+static void llama_sampler_lua_accept(struct llama_sampler * smpl, llama_token token) {
+    auto * ctx = (llama_sampler_lua *) smpl->ctx;
+    lua_State * L = ctx->L;
+
+    lua_getglobal(L, "accept");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        return;
+    }
+
+    lua_pushinteger(L, token);
+    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+        LLAMA_LOG_WARN("%s: lua error in accept: %s\n", __func__, lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+}
+
+static void llama_sampler_lua_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    auto * ctx = (llama_sampler_lua *) smpl->ctx;
+    lua_State * L = ctx->L;
+
+    lua_getglobal(L, "apply");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        LLAMA_LOG_WARN("%s: lua: 'apply' function not found\n", __func__);
+        return;
+    }
+
+    // Build candidates table: {n=n, sorted=bool, data={{id, logit, p}, ...}}
+    lua_newtable(L);
+
+    lua_pushinteger(L, (lua_Integer) cur_p->size);
+    lua_setfield(L, -2, "n");
+
+    lua_pushboolean(L, cur_p->sorted);
+    lua_setfield(L, -2, "sorted");
+
+    lua_newtable(L);  // data array (1-based)
+    for (size_t i = 0; i < cur_p->size; i++) {
+        lua_newtable(L);
+        lua_pushinteger(L, cur_p->data[i].id);
+        lua_setfield(L, -2, "id");
+        lua_pushnumber(L, cur_p->data[i].logit);
+        lua_setfield(L, -2, "logit");
+        lua_pushnumber(L, cur_p->data[i].p);
+        lua_setfield(L, -2, "p");
+        lua_rawseti(L, -2, (lua_Integer)(i + 1));
+    }
+    lua_setfield(L, -2, "data");
+
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        LLAMA_LOG_WARN("%s: lua error in apply: %s\n", __func__, lua_tostring(L, -1));
+        lua_pop(L, 1);
+        return;
+    }
+
+    // Integer return value is a 1-based index into candidates
+    if (lua_type(L, -1) == LUA_TNUMBER) {
+        const lua_Integer idx = lua_tointeger(L, -1);
+        if (idx >= 1 && idx <= (lua_Integer) cur_p->size) {
+            cur_p->selected = (int32_t)(idx - 1);
+        }
+    }
+
+    lua_pop(L, 1);
+}
+
+static void llama_sampler_lua_reset(struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_lua *) smpl->ctx;
+    lua_State * L = ctx->L;
+
+    lua_getglobal(L, "reset");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        return;
+    }
+
+    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        LLAMA_LOG_WARN("%s: lua error in reset: %s\n", __func__, lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+}
+
+static struct llama_sampler * llama_sampler_init_lua_impl(const char * script_path);
+
+static struct llama_sampler * llama_sampler_lua_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const llama_sampler_lua *) smpl->ctx;
+    return llama_sampler_init_lua_impl(ctx->script_path.c_str());
+}
+
+static void llama_sampler_lua_free(struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_lua *) smpl->ctx;
+    if (ctx->L) {
+        lua_close(ctx->L);
+    }
+    delete ctx;
+}
+
+static struct llama_sampler_i llama_sampler_lua_i = {
+    /* .name              = */ llama_sampler_lua_name,
+    /* .accept            = */ llama_sampler_lua_accept,
+    /* .apply             = */ llama_sampler_lua_apply,
+    /* .reset             = */ llama_sampler_lua_reset,
+    /* .clone             = */ llama_sampler_lua_clone,
+    /* .free              = */ llama_sampler_lua_free,
+    /* .backend_init      = */ nullptr,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ nullptr,
+    /* .backend_set_input = */ nullptr,
+};
+
+static struct llama_sampler * llama_sampler_init_lua_impl(const char * script_path) {
+    lua_State * L = luaL_newstate();
+    if (!L) {
+        LLAMA_LOG_WARN("%s: failed to create Lua state\n", __func__);
+        return nullptr;
+    }
+
+    luaL_openlibs(L);
+
+    if (luaL_loadfile(L, script_path) != LUA_OK) {
+        LLAMA_LOG_WARN("%s: failed to load Lua script '%s': %s\n", __func__, script_path, lua_tostring(L, -1));
+        lua_close(L);
+        return nullptr;
+    }
+
+    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        LLAMA_LOG_WARN("%s: failed to execute Lua script '%s': %s\n", __func__, script_path, lua_tostring(L, -1));
+        lua_close(L);
+        return nullptr;
+    }
+
+    lua_getglobal(L, "apply");
+    const bool has_apply = lua_isfunction(L, -1);
+    lua_pop(L, 1);
+
+    if (!has_apply) {
+        LLAMA_LOG_WARN("%s: Lua script '%s' does not define an 'apply' function\n", __func__, script_path);
+        lua_close(L);
+        return nullptr;
+    }
+
+    return llama_sampler_init(
+        /* .iface = */ &llama_sampler_lua_i,
+        /* .ctx   = */ new llama_sampler_lua {
+            /* .script_path = */ script_path,
+            /* .L           = */ L,
+        }
+    );
+}
+
+struct llama_sampler * llama_sampler_init_lua(const char * script_path) {
+    return llama_sampler_init_lua_impl(script_path);
+}
+
+#endif // LLAMA_USE_LUA
+
 // utils
 
 uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl) {
