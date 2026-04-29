@@ -362,8 +362,19 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
             // only if user explicitly included adaptive-p sampler
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
         } else {
-            // default: sample from distribution
-            samplers.push_back(llama_sampler_init_dist(params.seed));
+#ifdef LLAMA_USE_LUA
+            if (!params.lua_sampler.empty()) {
+                llama_sampler * lua_smpl = llama_sampler_init_lua(params.lua_sampler.c_str());
+                if (!lua_smpl) {
+                    GGML_ABORT("failed to initialize Lua sampler from '%s'", params.lua_sampler.c_str());
+                }
+                samplers.push_back(lua_smpl);
+            } else
+#endif // LLAMA_USE_LUA
+            {
+                // default: sample from distribution
+                samplers.push_back(llama_sampler_init_dist(params.seed));
+            }
         }
     } else if (params.mirostat == 1) {
         samplers.push_back(llama_sampler_init_temp(params.temp));

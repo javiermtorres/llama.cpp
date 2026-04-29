@@ -1896,6 +1896,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sampling.backend_sampling = true;
         }
     ).set_sampling().set_env("LLAMA_ARG_BACKEND_SAMPLING"));
+#ifdef LLAMA_USE_LUA
+    add_opt(common_arg(
+        {"--lua-sampler"}, "FNAME",
+        "path to a Lua script that implements token selection (requires build with -DLLAMA_LUA=ON)\n"
+        "the script must define: function apply(candidates) ... return idx end\n"
+        "where candidates.data[i] has fields id, logit, p and the return value is a 1-based index",
+        [](common_params & params, const std::string & value) {
+            params.sampling.lua_sampler = value;
+        }
+    ).set_sampling());
+#endif // LLAMA_USE_LUA
     add_opt(common_arg(
         {"--pooling"}, "{none,mean,cls,last,rank}",
         "pooling type for embeddings, use model default if unspecified",
