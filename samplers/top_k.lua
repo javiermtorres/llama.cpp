@@ -6,7 +6,7 @@
 
 local k = 50  -- number of top candidates to consider
 
-math.randomseed(os.time())
+math.randomseed(math.floor(os.time() + os.clock() * 1e6))
 
 function apply(candidates)
     local n    = candidates.n

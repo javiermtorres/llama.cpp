@@ -9,17 +9,31 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#else
+#include <unistd.h>
+#endif
 
 #ifdef LLAMA_USE_LUA
 
 // Write a Lua script string to a temporary file and return its path.
+// Uses the process ID in the filename to avoid collisions when tests run in parallel.
 static std::string write_lua_script(const char * name, const char * code) {
-    std::string path = std::string("/tmp/") + name;
-    FILE * f = fopen(path.c_str(), "w");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s_%d.lua",
+#ifdef _WIN32
+             getenv("TEMP") ? getenv("TEMP") : ".",
+#else
+             "/tmp",
+#endif
+             name, (int)getpid());
+    FILE * f = fopen(path, "w");
     assert(f != nullptr);
     fputs(code, f);
     fclose(f);
-    return path;
+    return std::string(path);
 }
 
 // Build a small candidate array for testing.
@@ -47,7 +61,7 @@ static void test_lua_greedy() {
         "    return best\n"
         "end\n";
 
-    std::string path = write_lua_script("test_greedy.lua", script);
+    std::string path = write_lua_script("test_greedy", script);
 
     llama_sampler * smpl = llama_sampler_init_lua(path.c_str());
     assert(smpl != nullptr);
@@ -62,16 +76,12 @@ static void test_lua_greedy() {
     assert(cur_p.selected == 2);
 
     llama_sampler_free(smpl);
+    remove(path.c_str());
     printf("test_lua_greedy passed\n");
 }
 
 // Test: accept and reset callbacks are invoked without errors.
 static void test_lua_callbacks() {
-    static int accept_calls = 0;
-    static int reset_calls  = 0;
-    (void)accept_calls;
-    (void)reset_calls;
-
     const char * script =
         "accept_calls = 0\n"
         "reset_calls  = 0\n"
@@ -85,7 +95,7 @@ static void test_lua_callbacks() {
         "    reset_calls = reset_calls + 1\n"
         "end\n";
 
-    std::string path = write_lua_script("test_callbacks.lua", script);
+    std::string path = write_lua_script("test_callbacks", script);
 
     llama_sampler * smpl = llama_sampler_init_lua(path.c_str());
     assert(smpl != nullptr);
@@ -100,6 +110,7 @@ static void test_lua_callbacks() {
     llama_sampler_reset(smpl);
 
     llama_sampler_free(smpl);
+    remove(path.c_str());
     printf("test_lua_callbacks passed\n");
 }
 
@@ -107,11 +118,12 @@ static void test_lua_callbacks() {
 static void test_lua_missing_apply() {
     const char * script = "-- no apply function defined\n";
 
-    std::string path = write_lua_script("test_missing_apply.lua", script);
+    std::string path = write_lua_script("test_missing_apply", script);
 
     llama_sampler * smpl = llama_sampler_init_lua(path.c_str());
     assert(smpl == nullptr);
 
+    remove(path.c_str());
     printf("test_lua_missing_apply passed\n");
 }
 
@@ -119,11 +131,12 @@ static void test_lua_missing_apply() {
 static void test_lua_syntax_error() {
     const char * script = "this is not valid lua !!!\n";
 
-    std::string path = write_lua_script("test_syntax_error.lua", script);
+    std::string path = write_lua_script("test_syntax_error", script);
 
     llama_sampler * smpl = llama_sampler_init_lua(path.c_str());
     assert(smpl == nullptr);
 
+    remove(path.c_str());
     printf("test_lua_syntax_error passed\n");
 }
 
@@ -134,7 +147,7 @@ static void test_lua_clone() {
         "    return candidates.n  -- always select the last candidate\n"
         "end\n";
 
-    std::string path = write_lua_script("test_clone.lua", script);
+    std::string path = write_lua_script("test_clone", script);
 
     llama_sampler * orig = llama_sampler_init_lua(path.c_str());
     assert(orig != nullptr);
@@ -151,6 +164,7 @@ static void test_lua_clone() {
 
     llama_sampler_free(orig);
     llama_sampler_free(cloned);
+    remove(path.c_str());
     printf("test_lua_clone passed\n");
 }
 

@@ -9,8 +9,8 @@
 
 local temperature = 0.8
 
--- Seed the RNG once on startup.
-math.randomseed(os.time())
+-- Seed the RNG with a combination of wall time and CPU time for better uniqueness.
+math.randomseed(math.floor(os.time() + os.clock() * 1e6))
 
 function apply(candidates)
     local n    = candidates.n
