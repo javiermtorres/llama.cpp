@@ -18,7 +18,7 @@
 //   local tokens = llama.tokenize(ctx, text, add_bos)  -- returns 1-based table
 //
 //   -- Batch management
-//   local batch = llama.batch_init(max_tokens)
+//   local batch = llama.batch_init(max_tokens [, n_seq_max])
 //   llama.batch_free(batch)
 //   llama.batch_clear(batch)
 //   llama.batch_add(batch, token_id, pos, seq_ids, want_logits)
@@ -27,17 +27,24 @@
 //   -- Decode
 //   local ok = llama.decode(ctx, batch)  -- true on success
 //
-//   -- Logits (valid until next decode call)
-//   local logits = llama.get_logits_ith(ctx, batch_index)  -- 0-based batch_index
+//   -- Logits / probabilities (valid until next decode call)
+//   local logits    = llama.get_logits_ith(ctx, i)        -- output index i (0-based, or -1 for last)
 //     -- returns 1-based table of n_vocab floats
+//   local probs     = llama.softmax(logits)               -- numerically stable softmax
+//     -- returns 1-based table of n_vocab floats
+//   local cands     = llama.make_candidates(logits [, k]) -- sampler-hook-format candidates table
+//     -- if k > 0, only the top-k candidates are included (sorted by logit descending)
+//     -- cands.n, cands.sorted, cands.data[i].{id, logit, p}
+//   local tok, logit, lp = llama.argmax_logits_ith(ctx, i)  -- fast greedy pick (no Lua table)
+//     -- returns 0-based token id, raw logit, and log-probability
 //
 //   -- Memory / KV-cache management
-//   llama.seq_cp(ctx, src_seq_id, dst_seq_id, p0, p1)
-//   llama.seq_rm(ctx, seq_id, p0, p1)
+//   llama.seq_cp(ctx, src_seq_id, dst_seq_id [, p0, p1])  -- p1=-1 means "all"
+//   llama.seq_rm(ctx, seq_id [, p0, p1])
 //   llama.seq_keep(ctx, seq_id)
 //
 // Usage:
-//   llama-lua --script my_script.lua --model model.gguf [extra args passed to Lua as arg table]
+//   llama-lua --script my_script.lua --model model.gguf [-- extra args passed to Lua as arg table]
 
 #include "llama.h"
 
@@ -47,8 +54,11 @@ extern "C" {
 #include <lualib.h>
 }
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -378,6 +388,182 @@ static int l_get_logits_ith(lua_State * L) {
 }
 
 // ---------------------------------------------------------------------------
+// llama.softmax(logits) -> 1-based table of n_vocab probabilities
+//   Numerically stable softmax: P[i] = exp(logits[i] - max) / sum
+// ---------------------------------------------------------------------------
+static int l_softmax(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    int n = (int) lua_rawlen(L, 1);
+    if (n <= 0) {
+        lua_createtable(L, 0, 0);
+        return 1;
+    }
+
+    std::vector<float> v(n);
+    for (int i = 0; i < n; ++i) {
+        lua_rawgeti(L, 1, i + 1);
+        v[i] = (float) lua_tonumber(L, -1);
+        lua_pop(L, 1);
+    }
+
+    float max_v = *std::max_element(v.begin(), v.end());
+    float sum   = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        v[i]  = std::exp(v[i] - max_v);
+        sum  += v[i];
+    }
+
+    lua_createtable(L, n, 0);
+    for (int i = 0; i < n; ++i) {
+        lua_pushnumber(L, (lua_Number)(v[i] / sum));
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// llama.make_candidates(logits [, top_k]) -> candidates table
+//
+// Returns a candidates table in the same format used by the llama_sampler_i
+// hook, so that sampler scripts that define apply(candidates) can be used
+// unchanged inside llama-lua scripts:
+//
+//   cands.n          -- number of candidates (n_vocab, or top_k if k > 0)
+//   cands.sorted     -- true if k > 0 (sorted by logit descending)
+//   cands.data[i]    -- 1-based
+//     .id            -- 0-based token id
+//     .logit         -- raw logit
+//     .p             -- softmax probability
+//
+// Example bridge to an existing sampler script:
+//   dofile("samplers/greedy.lua")          -- defines apply(candidates)
+//   local logits = llama.get_logits_ith(ctx, -1)
+//   local cands  = llama.make_candidates(logits)
+//   local sel    = apply(cands)            -- returns 1-based index
+//   local tok    = cands.data[sel].id     -- 0-based token id
+//
+// Note: building a full n_vocab table on every step carries overhead.
+// When only the argmax is needed (e.g. greedy rollout), prefer
+// llama.argmax_logits_ith() instead.
+// ---------------------------------------------------------------------------
+static int l_make_candidates(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    int n      = (int) lua_rawlen(L, 1);
+    int top_k  = (int) luaL_optinteger(L, 2, 0); // 0 = all
+    if (n <= 0) {
+        return push_error(L, "make_candidates: logits table is empty");
+    }
+
+    std::vector<float> logits(n);
+    for (int i = 0; i < n; ++i) {
+        lua_rawgeti(L, 1, i + 1);
+        logits[i] = (float) lua_tonumber(L, -1);
+        lua_pop(L, 1);
+    }
+
+    // softmax
+    float max_l = *std::max_element(logits.begin(), logits.end());
+    float sum   = 0.0f;
+    std::vector<float> probs(n);
+    for (int i = 0; i < n; ++i) {
+        probs[i]  = std::exp(logits[i] - max_l);
+        sum      += probs[i];
+    }
+    for (int i = 0; i < n; ++i) probs[i] /= sum;
+
+    // build index list, optionally top-k sorted
+    std::vector<int> idx(n);
+    std::iota(idx.begin(), idx.end(), 0);
+    bool sorted = (top_k > 0);
+    if (sorted) {
+        if (top_k > n) top_k = n;
+        std::partial_sort(idx.begin(), idx.begin() + top_k, idx.end(),
+            [&](int a, int b){ return logits[a] > logits[b]; });
+        idx.resize(top_k);
+    }
+
+    int out_n = (int) idx.size();
+
+    // build Lua table: {n=..., sorted=..., data={...}}
+    lua_createtable(L, 0, 3);
+
+    lua_pushinteger(L, out_n);
+    lua_setfield(L, -2, "n");
+
+    lua_pushboolean(L, sorted ? 1 : 0);
+    lua_setfield(L, -2, "sorted");
+
+    lua_createtable(L, out_n, 0);
+    for (int i = 0; i < out_n; ++i) {
+        int ti = idx[i];         // token index (0-based id)
+        lua_createtable(L, 0, 3);
+
+        lua_pushinteger(L, ti);
+        lua_setfield(L, -2, "id");
+
+        lua_pushnumber(L, (lua_Number) logits[ti]);
+        lua_setfield(L, -2, "logit");
+
+        lua_pushnumber(L, (lua_Number) probs[ti]);
+        lua_setfield(L, -2, "p");
+
+        lua_rawseti(L, -2, i + 1); // 1-based
+    }
+    lua_setfield(L, -2, "data");
+
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// llama.argmax_logits_ith(ctx, output_index) -> token_id, logit, log_prob
+//
+// Fast greedy pick: scans logits in C++ and returns the single best token.
+// output_index follows the same convention as get_logits_ith (0-based among
+// tokens that requested logits, or -1 for the last output).
+//
+// Use this inside simulation rollouts where building a full n_vocab Lua table
+// on every step would be too slow.
+// ---------------------------------------------------------------------------
+static int l_argmax_logits_ith(lua_State * L) {
+    llama_context ** pp = check_ctx(L, 1);
+    int32_t          i  = (int32_t) luaL_checkinteger(L, 2);
+
+    const float * logits = llama_get_logits_ith(*pp, i);
+    if (!logits) {
+        return push_error(L, "argmax_logits_ith(%d) returned NULL", i);
+    }
+
+    const llama_model * model   = llama_get_model(*pp);
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
+    int32_t             n_vocab = llama_vocab_n_tokens(vocab);
+
+    // argmax
+    int32_t best_id   = 0;
+    float   best_logit = logits[0];
+    for (int32_t v = 1; v < n_vocab; ++v) {
+        if (logits[v] > best_logit) {
+            best_logit = logits[v];
+            best_id    = v;
+        }
+    }
+
+    // log-prob of the best token via numerically-stable softmax:
+    //   P(best) = exp(best_logit - best_logit) / sum_i exp(logit[i] - best_logit)
+    //           = 1 / sum
+    //   log P(best) = -log(sum)
+    float sum = 0.0f;
+    for (int32_t v = 0; v < n_vocab; ++v) {
+        sum += std::exp(logits[v] - best_logit);
+    }
+    float log_prob = -(float) std::log((double) sum);
+
+    lua_pushinteger(L, best_id);
+    lua_pushnumber(L, (lua_Number) best_logit);
+    lua_pushnumber(L, (lua_Number) log_prob);
+    return 3;
+}
+
+// ---------------------------------------------------------------------------
 // KV-cache / sequence management
 // ---------------------------------------------------------------------------
 static int l_seq_cp(lua_State * L) {
@@ -410,21 +596,24 @@ static int l_seq_keep(lua_State * L) {
 // Register the "llama" module
 // ---------------------------------------------------------------------------
 static const luaL_Reg llama_funcs[] = {
-    { "model_load",      l_model_load    },
-    { "context_init",    l_context_init  },
-    { "n_vocab",         l_n_vocab       },
-    { "token_bos",       l_token_bos     },
-    { "token_eos",       l_token_eos     },
-    { "token_to_piece",  l_token_to_piece},
-    { "tokenize",        l_tokenize      },
-    { "batch_init",      l_batch_init    },
-    { "batch_clear",     l_batch_clear   },
-    { "batch_add",       l_batch_add     },
-    { "decode",          l_decode        },
-    { "get_logits_ith",  l_get_logits_ith},
-    { "seq_cp",          l_seq_cp        },
-    { "seq_rm",          l_seq_rm        },
-    { "seq_keep",        l_seq_keep      },
+    { "model_load",          l_model_load        },
+    { "context_init",        l_context_init      },
+    { "n_vocab",             l_n_vocab           },
+    { "token_bos",           l_token_bos         },
+    { "token_eos",           l_token_eos         },
+    { "token_to_piece",      l_token_to_piece    },
+    { "tokenize",            l_tokenize          },
+    { "batch_init",          l_batch_init        },
+    { "batch_clear",         l_batch_clear       },
+    { "batch_add",           l_batch_add         },
+    { "decode",              l_decode            },
+    { "get_logits_ith",      l_get_logits_ith    },
+    { "softmax",             l_softmax           },
+    { "make_candidates",     l_make_candidates   },
+    { "argmax_logits_ith",   l_argmax_logits_ith },
+    { "seq_cp",              l_seq_cp            },
+    { "seq_rm",              l_seq_rm            },
+    { "seq_keep",            l_seq_keep          },
     { nullptr, nullptr }
 };
 
