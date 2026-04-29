@@ -1451,6 +1451,28 @@ extern "C" {
     //
     LLAMA_API struct llama_sampler * llama_sampler_init_infill(const struct llama_vocab * vocab);
 
+#ifdef LLAMA_USE_LUA
+    // Lua-based sampler that delegates token selection to a Lua script.
+    //
+    // The script must define an 'apply' function:
+    //
+    //   function apply(candidates)
+    //
+    // where 'candidates' is a table with fields:
+    //   - n:      number of candidates (integer)
+    //   - sorted: whether candidates are sorted by logit descending (boolean)
+    //   - data:   array (1-based) of {id, logit, p} tables
+    //
+    // The function should return an integer index (1-based) to select that
+    // candidate, or nil to leave the selection to subsequent samplers.
+    //
+    // The script may also optionally define:
+    //   function accept(token_id)  -- called when a token is accepted
+    //   function reset()           -- called when the sampler chain is reset
+    //
+    LLAMA_API struct llama_sampler * llama_sampler_init_lua(const char * script_path);
+#endif // LLAMA_USE_LUA
+
     // Returns the seed used by the sampler if applicable, LLAMA_DEFAULT_SEED otherwise
     LLAMA_API uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl);
 

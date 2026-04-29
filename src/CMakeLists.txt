@@ -53,6 +53,13 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (LLAMA_LUA)
+    find_package(Lua 5.4 REQUIRED)
+    target_compile_definitions(llama PUBLIC LLAMA_USE_LUA)
+    target_include_directories(llama PRIVATE ${LUA_INCLUDE_DIR})
+    target_link_libraries(llama PUBLIC ${LUA_LIBRARIES})
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

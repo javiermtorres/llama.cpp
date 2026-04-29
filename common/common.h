@@ -278,6 +278,8 @@ struct common_params_sampling {
 
     bool backend_sampling = false;
 
+    std::string lua_sampler; // path to Lua script for custom token selection (requires LLAMA_LUA build)
+
     bool has_logit_bias() const {
         return !logit_bias.empty();
     }
